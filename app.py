@@ -1,23 +1,17 @@
 from flask import Flask, render_template, request, send_file, jsonify
 import re
 import requests
+import os
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from unidecode import unidecode
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import os
-
 app = Flask(__name__)
 
 EXCEL_FILE = os.environ.get("EXCEL_FILE", "nrl.xlsx")
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 15))
-
-# Regex patterns - compile 1 lần
-RE_STT = re.compile(r'^\d{1,4}$')
-RE_NRL = re.compile(r'^(\d+\.?\d*)$')
-RE_DOC_ID = re.compile(r'/d/([a-zA-Z0-9_-]+)')
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 10))
 
 _cached_docs = None
 
@@ -28,35 +22,40 @@ def get_doc_links():
         return _cached_docs
     
     if not os.path.exists(EXCEL_FILE):
-        print(f"[ERROR] File {EXCEL_FILE} không tồn tại!")
+        print(f"[ERROR] File {EXCEL_FILE} khong ton tai!")
         return []
     
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb.active
-    
-    doc_links = []
-    for row in ws.iter_rows():
-        for cell in row:
-            if cell.hyperlink and cell.hyperlink.target:
-                link = cell.hyperlink.target
-                if "docs.google.com/document" in link:
-                    cell_value = str(cell.value) if cell.value else ""
-                    doc_links.append({"link": link, "name": cell_value})
-    
-    seen = set()
-    unique_docs = []
-    for doc in doc_links:
-        if doc["link"] not in seen:
-            seen.add(doc["link"])
-            unique_docs.append(doc)
-    
-    _cached_docs = unique_docs
-    return unique_docs
+    try:
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb.active
+        
+        doc_links = []
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.hyperlink and cell.hyperlink.target:
+                    link = cell.hyperlink.target
+                    if "docs.google.com/document" in link:
+                        cell_value = str(cell.value) if cell.value else ""
+                        doc_links.append({"link": link, "name": cell_value})
+        
+        seen = set()
+        unique_docs = []
+        for doc in doc_links:
+            if doc["link"] not in seen:
+                seen.add(doc["link"])
+                unique_docs.append(doc)
+        
+        _cached_docs = unique_docs
+        print(f"[INFO] Loaded {len(unique_docs)} docs from Excel")
+        return unique_docs
+    except Exception as e:
+        print(f"[ERROR] Load Excel failed: {e}")
+        return []
 
 
 def read_doc_text(url, session):
     try:
-        match = RE_DOC_ID.search(url)
+        match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
         if not match:
             return None
         doc_id = match.group(1)
@@ -68,8 +67,7 @@ def read_doc_text(url, session):
                 if r.status_code == 200 and "accounts.google.com" not in r.url:
                     return r.text
             except:
-                if attempt == 0:
-                    continue
+                continue
         return None
     except:
         return None
@@ -79,6 +77,20 @@ def normalize_text(text):
     text = unidecode(text.lower())
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+def is_valid_stt(s):
+    """Kiem tra STT hop le (1-4 chu so)"""
+    return bool(re.match(r'^\d{1,4}$', s))
+
+
+def is_valid_nrl(s):
+    """Kiem tra NRL hop le (so tu 0-10)"""
+    match = re.match(r'^(\d+\.?\d*)$', s)
+    if match:
+        val = float(match.group(1))
+        return 0 <= val <= 10, val
+    return False, None
 
 
 def find_student_in_content(content, ten_sv, mssv):
@@ -93,7 +105,6 @@ def find_student_in_content(content, ten_sv, mssv):
     
     lines = content.split('\n')
     
-    # Tìm theo tên
     for i, line in enumerate(lines):
         line_normalized = normalize_text(line)
         
@@ -103,21 +114,18 @@ def find_student_in_content(content, ten_sv, mssv):
             
             if i > 0:
                 prev = lines[i-1].strip()
-                if RE_STT.match(prev):
+                if is_valid_stt(prev):
                     stt = int(prev)
             
             for j in range(i+1, min(i+6, len(lines))):
                 check = lines[j].strip().replace(',', '.')
-                match = RE_NRL.match(check)
-                if match:
-                    val = float(match.group(1))
-                    if 0 <= val <= 10:
-                        nrl = val
-                        break
+                valid, val = is_valid_nrl(check)
+                if valid:
+                    nrl = val
+                    break
             
             return True, stt, nrl
     
-    # Tìm theo MSSV
     for i, line in enumerate(lines):
         if mssv in line:
             stt = None
@@ -125,16 +133,14 @@ def find_student_in_content(content, ten_sv, mssv):
             
             if i >= 3:
                 stt_line = lines[i-3].strip()
-                if RE_STT.match(stt_line):
+                if is_valid_stt(stt_line):
                     stt = int(stt_line)
             
             if i + 1 < len(lines):
                 nrl_line = lines[i+1].strip().replace(',', '.')
-                match = RE_NRL.match(nrl_line)
-                if match:
-                    val = float(match.group(1))
-                    if 0 <= val <= 10:
-                        nrl = val
+                valid, val = is_valid_nrl(nrl_line)
+                if valid:
+                    nrl = val
             
             return True, stt, nrl
     
@@ -182,25 +188,25 @@ def create_excel(results, ten_sv, mssv, total_nrl):
     )
     
     ws_out.merge_cells('A1:D1')
-    ws_out['A1'] = "BÁO CÁO KẾT QUẢ ĐIỂM RÈN LUYỆN"
+    ws_out['A1'] = "BAO CAO KET QUA DIEM REN LUYEN"
     ws_out['A1'].font = Font(bold=True, size=14)
     ws_out['A1'].alignment = center
     
-    ws_out['A3'] = "Họ và tên:"
+    ws_out['A3'] = "Ho va ten:"
     ws_out['B3'] = ten_sv.upper()
     ws_out['A4'] = "MSSV:"
     ws_out['B4'] = mssv
-    ws_out['A5'] = "Ngày xuất:"
+    ws_out['A5'] = "Ngay xuat:"
     ws_out['B5'] = datetime.now().strftime('%d/%m/%Y %H:%M')
     
-    ws_out['A7'] = "Số file tìm thấy:"
+    ws_out['A7'] = "So file tim thay:"
     ws_out['B7'] = len(results)
-    ws_out['A8'] = "TỔNG ĐIỂM NRL:"
+    ws_out['A8'] = "TONG DIEM NRL:"
     ws_out['B8'] = total_nrl
     ws_out['A8'].font = Font(bold=True, color="0000FF")
     ws_out['B8'].font = Font(bold=True, color="0000FF")
     
-    table_headers = ["#", "STT", "NRL", "Tên file", "Link"]
+    table_headers = ["#", "STT", "NRL", "Ten file", "Link"]
     for col, h in enumerate(table_headers, 1):
         cell = ws_out.cell(row=10, column=col, value=h)
         cell.font = header_font
@@ -226,13 +232,25 @@ def create_excel(results, ten_sv, mssv, total_nrl):
     ws_out.column_dimensions['E'].width = 60
     
     wb_out.save(output_file)
-    print(f"[INFO] Đã tạo file: {output_file}")
+    print(f"[INFO] Created: {output_file}")
     return output_file
 
 
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/health')
+def health():
+    """Health check endpoint"""
+    docs = get_doc_links()
+    return jsonify({
+        "status": "ok",
+        "excel_file": EXCEL_FILE,
+        "excel_exists": os.path.exists(EXCEL_FILE),
+        "total_docs": len(docs)
+    })
 
 
 @app.route('/search', methods=['POST'])
@@ -242,21 +260,19 @@ def search():
         mssv = request.form.get('mssv', '').strip()
         
         if not ten_sv or not mssv:
-            return jsonify({"error": "Vui lòng nhập cả tên VÀ MSSV"})
+            return jsonify({"error": "Vui long nhap ca ten VA MSSV"})
         
         unique_docs = get_doc_links()
+        
+        if not unique_docs:
+            return jsonify({"error": "Khong tim thay file Excel hoac file rong"})
+        
         results = []
         
         session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=MAX_WORKERS,
-            pool_maxsize=MAX_WORKERS,
-            max_retries=1
-        )
-        session.mount('https://', adapter)
         session.headers.update({"User-Agent": "Mozilla/5.0"})
         
-        print(f"[INFO] Quét {len(unique_docs)} files cho {ten_sv} - {mssv}")
+        print(f"[INFO] Scanning {len(unique_docs)} files for {ten_sv} - {mssv}")
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [
@@ -272,7 +288,7 @@ def search():
         results.sort(key=lambda x: (x["stt"] if isinstance(x["stt"], int) else 9999))
         total_nrl = sum(r["nrl"] for r in results if isinstance(r["nrl"], (int, float)))
         
-        print(f"[INFO] Tìm thấy {len(results)} kết quả, tổng NRL: {total_nrl}")
+        print(f"[INFO] Found {len(results)} results, total NRL: {total_nrl}")
         
         return jsonify({
             "results": results,
@@ -283,7 +299,7 @@ def search():
         })
     except Exception as e:
         print(f"[ERROR] Search failed: {e}")
-        return jsonify({"error": f"Lỗi server: {str(e)}"}), 500
+        return jsonify({"error": f"Loi server: {str(e)}"}), 500
 
 
 @app.route('/download', methods=['POST'])
@@ -291,7 +307,7 @@ def download():
     try:
         data = request.get_json()
         if not data:
-            return jsonify({"error": "Không có dữ liệu"}), 400
+            return jsonify({"error": "Khong co du lieu"}), 400
             
         results = data.get('results', [])
         ten_sv = data.get('ten_sv', '')
@@ -299,13 +315,13 @@ def download():
         total_nrl = data.get('total_nrl', 0)
         
         if not results:
-            return jsonify({"error": "Không có kết quả để tải"}), 400
+            return jsonify({"error": "Khong co ket qua de tai"}), 400
         
         excel_file = create_excel(results, ten_sv, mssv, total_nrl)
         return send_file(excel_file, as_attachment=True)
     except Exception as e:
         print(f"[ERROR] Download failed: {e}")
-        return jsonify({"error": f"Lỗi tạo file: {str(e)}"}), 500
+        return jsonify({"error": f"Loi tao file: {str(e)}"}), 500
 
 
 if __name__ == '__main__':
