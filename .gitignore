@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+.env
+ket_qua_*.xlsx
+*.log

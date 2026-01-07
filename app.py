@@ -7,10 +7,12 @@ from unidecode import unidecode
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import os
+
 app = Flask(__name__)
 
-EXCEL_FILE = "nrl.xlsx"
-MAX_WORKERS = 15
+EXCEL_FILE = os.environ.get("EXCEL_FILE", "nrl.xlsx")
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 15))
 
 # Regex patterns - compile 1 lần
 RE_STT = re.compile(r'^\d{1,4}$')
@@ -24,6 +26,10 @@ def get_doc_links():
     global _cached_docs
     if _cached_docs is not None:
         return _cached_docs
+    
+    if not os.path.exists(EXCEL_FILE):
+        print(f"[ERROR] File {EXCEL_FILE} không tồn tại!")
+        return []
     
     wb = load_workbook(EXCEL_FILE)
     ws = wb.active
@@ -303,4 +309,6 @@ def download():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("DEBUG", "false").lower() == "true"
+    app.run(host='0.0.0.0', port=port, debug=debug)
