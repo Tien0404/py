@@ -11,15 +11,21 @@ import threading
 # =====================
 # THÔNG TIN CỦA BẠN
 # =====================
-TEN_SV = "vo duc tien"
-MSSV = "2254810130"
+TEN_SV = "Cao Hoàng Trí"
+MSSV = "2433520225"
 
 EXCEL_FILE = "nrl.xlsx"
 OUTPUT_XLSX = "ket_qua_nrl.xlsx"
-MAX_WORKERS = 15
+MAX_WORKERS = 20
+REQUEST_TIMEOUT = 8
 
 http_headers = {"User-Agent": "Mozilla/5.0"}
 session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS,
+    pool_maxsize=MAX_WORKERS
+)
+session.mount('https://', adapter)
 session.headers.update(http_headers)
 
 print_lock = threading.Lock()
@@ -56,36 +62,40 @@ print(f"⚡ Đang quét với {MAX_WORKERS} luồng song song...\n")
 # HÀM ĐỌC NỘI DUNG DOCS
 # =====================
 def read_doc_text(url):
-    """Đọc nội dung Google Docs với retry"""
     try:
-        doc_id = re.search(r"/d/([a-zA-Z0-9_-]+)", url).group(1)
+        match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
+        if not match:
+            return None
+        doc_id = match.group(1)
         export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
         
-        for attempt in range(2):
-            try:
-                r = session.get(export_url, timeout=15)
-                if r.status_code == 200 and "accounts.google.com" not in r.url:
-                    return r.text
-            except:
-                if attempt == 0:
-                    continue
+        r = session.get(export_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200 and "accounts.google.com" not in r.url:
+            return r.text
         return None
     except:
         return None
 
 
 def normalize_text(text):
-    """Chuẩn hóa text: bỏ dấu, lowercase, bỏ khoảng trắng thừa"""
     text = unidecode(text.lower())
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
+def is_valid_stt(s):
+    return bool(re.match(r'^\d{1,4}$', s))
+
+
+def is_valid_nrl(s):
+    match = re.match(r'^(\d+\.?\d*)$', s)
+    if match:
+        val = float(match.group(1))
+        return 0 <= val <= 10, val
+    return False, None
+
+
 def find_student_in_content(content, ten_sv, mssv):
-    """
-    Tìm sinh viên trong nội dung
-    Trả về (found, stt, nrl)
-    """
     content_normalized = normalize_text(content)
     ten_normalized = normalize_text(ten_sv)
     
@@ -97,7 +107,6 @@ def find_student_in_content(content, ten_sv, mssv):
     
     lines = content.split('\n')
     
-    # Cách 1: Tìm theo tên
     for i, line in enumerate(lines):
         line_normalized = normalize_text(line)
         
@@ -107,21 +116,18 @@ def find_student_in_content(content, ten_sv, mssv):
             
             if i > 0:
                 prev = lines[i-1].strip()
-                if re.match(r'^\d{1,4}$', prev):
+                if is_valid_stt(prev):
                     stt = int(prev)
             
             for j in range(i+1, min(i+6, len(lines))):
                 check = lines[j].strip().replace(',', '.')
-                match = re.match(r'^(\d+\.?\d*)$', check)
-                if match:
-                    val = float(match.group(1))
-                    if 0 <= val <= 10:
-                        nrl = val
-                        break
+                valid, val = is_valid_nrl(check)
+                if valid:
+                    nrl = val
+                    break
             
             return True, stt, nrl
     
-    # Cách 2: Tìm theo MSSV
     for i, line in enumerate(lines):
         if mssv in line:
             stt = None
@@ -129,16 +135,14 @@ def find_student_in_content(content, ten_sv, mssv):
             
             if i >= 3:
                 stt_line = lines[i-3].strip()
-                if re.match(r'^\d{1,4}$', stt_line):
+                if is_valid_stt(stt_line):
                     stt = int(stt_line)
             
             if i + 1 < len(lines):
                 nrl_line = lines[i+1].strip().replace(',', '.')
-                match = re.match(r'^(\d+\.?\d*)$', nrl_line)
-                if match:
-                    val = float(match.group(1))
-                    if 0 <= val <= 10:
-                        nrl = val
+                valid, val = is_valid_nrl(nrl_line)
+                if valid:
+                    nrl = val
             
             return True, stt, nrl
     
@@ -193,9 +197,12 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     }
     
     for future in as_completed(futures):
-        result = future.result()
-        if result:
-            results.append(result)
+        try:
+            result = future.result(timeout=1)
+            if result:
+                results.append(result)
+        except:
+            pass
 
 total_nrl = sum(r["nrl"] for r in results if isinstance(r["nrl"], (int, float)))
 

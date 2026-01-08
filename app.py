@@ -11,9 +11,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 app = Flask(__name__)
 
 EXCEL_FILE = os.environ.get("EXCEL_FILE", "nrl.xlsx")
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 10))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 20))
+REQUEST_TIMEOUT = 8
 
 _cached_docs = None
+
+# Pre-compile regex patterns
+RE_DOC_ID = re.compile(r'/d/([a-zA-Z0-9_-]+)')
+RE_STT = re.compile(r'^\d{1,5}$')
+RE_STT_FLEXIBLE = re.compile(r'^(\d{1,5})[.\)\]\s]*$')  # Match: "32", "32.", "32)", "32]"
+RE_NRL = re.compile(r'^(\d+\.?\d*)$')
+# Pattern cho MSSV (thường 8-12 số)
+RE_MSSV = re.compile(r'\b\d{8,12}\b')
+# Pattern cho dòng bảng (chứa nhiều cột)
+RE_TABLE_ROW = re.compile(r'[\t|]|(?:\s{2,})')
 
 
 def get_doc_links():
@@ -54,20 +65,23 @@ def get_doc_links():
 
 
 def read_doc_text(url, session):
+    """Đọc nội dung Google Docs với retry"""
     try:
-        match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
+        match = RE_DOC_ID.search(url)
         if not match:
             return None
         doc_id = match.group(1)
         export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
         
+        # Retry 2 lần
         for attempt in range(2):
             try:
-                r = session.get(export_url, timeout=15)
+                r = session.get(export_url, timeout=REQUEST_TIMEOUT)
                 if r.status_code == 200 and "accounts.google.com" not in r.url:
                     return r.text
             except:
-                continue
+                if attempt == 0:
+                    continue
         return None
     except:
         return None
@@ -80,71 +94,245 @@ def normalize_text(text):
 
 
 def is_valid_stt(s):
-    """Kiem tra STT hop le (1-4 chu so)"""
-    return bool(re.match(r'^\d{1,4}$', s))
+    """Kiểm tra STT - hỗ trợ nhiều format: 32, 32., 32), etc."""
+    s = s.strip()
+    # Thử match chính xác trước
+    if RE_STT.match(s):
+        return True
+    # Thử match flexible (có dấu chấm, ngoặc cuối)
+    if RE_STT_FLEXIBLE.match(s):
+        return True
+    return False
+
+
+def extract_stt_value(s):
+    """Trích xuất giá trị số từ STT"""
+    s = s.strip()
+    match = RE_STT.match(s)
+    if match:
+        return int(s)
+    match = RE_STT_FLEXIBLE.match(s)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def is_valid_nrl(s):
-    """Kiem tra NRL hop le (so tu 0-10)"""
-    match = re.match(r'^(\d+\.?\d*)$', s)
+    match = RE_NRL.match(s)
     if match:
         val = float(match.group(1))
-        return 0 <= val <= 10, val
+        if 0 <= val <= 10:
+            return True, val
     return False, None
 
 
+def parse_table_row(line):
+    """Tách dòng bảng thành các cột"""
+    # Thử tách theo tab trước
+    if '\t' in line:
+        return [c.strip() for c in line.split('\t') if c.strip()]
+    # Thử tách theo pipe |
+    if '|' in line:
+        return [c.strip() for c in line.split('|') if c.strip()]
+    # Thử tách theo nhiều space (2+)
+    parts = re.split(r'\s{2,}', line)
+    if len(parts) > 1:
+        return [c.strip() for c in parts if c.strip()]
+    # Fallback: tách theo space đơn
+    return [c.strip() for c in line.split() if c.strip()]
+
+
+def find_nrl_in_parts(parts, mssv):
+    """Tìm NRL trong các phần của dòng, ưu tiên phần sau MSSV"""
+    mssv_idx = -1
+    # Tìm vị trí MSSV
+    for i, part in enumerate(parts):
+        if mssv in part:
+            mssv_idx = i
+            break
+    
+    # Ưu tiên tìm NRL SAU MSSV (vì thường format: STT | Tên | Lớp | MSSV | NRL)
+    candidates = []
+    for i, part in enumerate(parts):
+        part_clean = part.replace(',', '.').strip()
+        valid, val = is_valid_nrl(part_clean)
+        if valid and part_clean != mssv and len(part_clean) <= 4:  # NRL thường ngắn
+            # Tính khoảng cách từ MSSV
+            distance = abs(i - mssv_idx) if mssv_idx >= 0 else i
+            # Ưu tiên sau MSSV
+            priority = 0 if i > mssv_idx else 1
+            candidates.append((priority, distance, val))
+    
+    if candidates:
+        # Sắp xếp theo priority, rồi distance
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2]
+    return None
+
+
+def find_stt_in_parts(parts, mssv):
+    """Tìm STT trong các phần của dòng, ưu tiên phần đầu"""
+    for i, part in enumerate(parts):
+        if is_valid_stt(part) and part != mssv:
+            # STT thường ở đầu và là số nhỏ
+            val = extract_stt_value(part)
+            if val is not None and val <= 10000:  # Giới hạn STT hợp lý
+                return val
+    return None
+
+
+def find_stt_in_line(line, mssv):
+    """Tìm STT trong một dòng - thử nhiều cách"""
+    # Cách 1: Parse như bảng
+    parts = parse_table_row(line)
+    stt = find_stt_in_parts(parts, mssv)
+    if stt:
+        return stt
+    
+    # Cách 2: Tìm số đầu tiên trong dòng (thường là STT)
+    match = re.match(r'^\s*(\d{1,5})[.\)\]\s]', line)
+    if match:
+        val = int(match.group(1))
+        if val <= 10000 and str(val) != mssv:
+            return val
+    
+    # Cách 3: Tìm số đứng đầu dòng sau khi strip
+    stripped = line.strip()
+    first_word = stripped.split()[0] if stripped.split() else ""
+    if is_valid_stt(first_word) and first_word != mssv:
+        val = extract_stt_value(first_word)
+        if val and val <= 10000:
+            return val
+    
+    return None
+
+
 def find_student_in_content(content, ten_sv, mssv):
+    """
+    Tìm sinh viên với thuật toán cải tiến:
+    1. Kiểm tra MSSV chính xác (word boundary)
+    2. Ưu tiên dòng có CẢ tên VÀ MSSV
+    3. Xử lý nhiều format bảng
+    4. Tìm trong vùng lân cận nếu không cùng dòng
+    """
     content_normalized = normalize_text(content)
     ten_normalized = normalize_text(ten_sv)
     
-    has_name = ten_normalized in content_normalized
-    has_mssv = mssv in content
+    # Tách họ tên thành các từ để tìm chính xác hơn
+    ten_parts = ten_normalized.split()
+    ten_cuoi = ten_parts[-1] if ten_parts else ten_normalized  # Tên riêng (từ cuối)
     
-    if not (has_name and has_mssv):
+    # Kiểm tra MSSV với word boundary (tránh match một phần)
+    mssv_pattern = re.compile(r'\b' + re.escape(mssv) + r'\b')
+    if not mssv_pattern.search(content):
+        return False, None, None
+    
+    # Kiểm tra tên có trong content không
+    if ten_normalized not in content_normalized and ten_cuoi not in content_normalized:
         return False, None, None
     
     lines = content.split('\n')
+    best_result = None
+    best_score = 0
     
     for i, line in enumerate(lines):
-        line_normalized = normalize_text(line)
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+            
+        # Kiểm tra dòng có MSSV không
+        if not mssv_pattern.search(line_stripped):
+            continue
         
-        if ten_normalized in line_normalized:
-            stt = None
-            nrl = None
+        line_normalized = normalize_text(line_stripped)
+        parts = parse_table_row(line_stripped)
+        
+        stt = None
+        nrl = None
+        score = 1  # Base score vì có MSSV
+        
+        # === PHƯƠNG PHÁP 1: Dữ liệu trên cùng 1 dòng (bảng) ===
+        if len(parts) >= 2:
+            # Kiểm tra có tên trong dòng không
+            if ten_normalized in line_normalized or ten_cuoi in line_normalized:
+                score += 5  # Bonus lớn vì cùng dòng với tên
             
-            if i > 0:
-                prev = lines[i-1].strip()
-                if is_valid_stt(prev):
-                    stt = int(prev)
+            # Tìm STT và NRL trong cùng dòng (dùng hàm mới)
+            stt = find_stt_in_line(line_stripped, mssv)
+            nrl = find_nrl_in_parts(parts, mssv)
             
-            for j in range(i+1, min(i+6, len(lines))):
-                check = lines[j].strip().replace(',', '.')
-                valid, val = is_valid_nrl(check)
-                if valid:
-                    nrl = val
-                    break
+            if stt:
+                score += 2
+            if nrl is not None:
+                score += 3
+        
+        # === PHƯƠNG PHÁP 2: Dữ liệu trên nhiều dòng ===
+        if stt is None or nrl is None:
+            # Tìm trong vùng lân cận (5 dòng trước và sau)
+            context_start = max(0, i - 5)
+            context_end = min(len(lines), i + 6)
+            context_lines = lines[context_start:context_end]
+            context_text = normalize_text(' '.join(context_lines))
             
-            return True, stt, nrl
+            # Kiểm tra tên có trong vùng lân cận không
+            if ten_normalized in context_text or ten_cuoi in context_text:
+                score += 2
+            else:
+                # Tên không gần MSSV -> có thể là người khác
+                continue
+            
+            # Tìm STT ở các dòng trước hoặc trong chính dòng hiện tại
+            if stt is None:
+                # Thử tìm trong chính dòng hiện tại trước
+                stt = find_stt_in_line(line_stripped, mssv)
+                
+                # Nếu không có, tìm ở các dòng trước
+                if stt is None:
+                    for offset in range(1, 6):
+                        if i - offset >= 0:
+                            prev_line = lines[i - offset].strip()
+                            # Thử tìm STT trong dòng
+                            found_stt = find_stt_in_line(prev_line, mssv)
+                            if found_stt:
+                                stt = found_stt
+                                break
+                            # Fallback: check nếu toàn dòng là số
+                            if is_valid_stt(prev_line):
+                                val = extract_stt_value(prev_line)
+                                if val and val <= 10000:
+                                    stt = val
+                                    break
+            
+            # Tìm NRL ở các dòng sau
+            if nrl is None:
+                for offset in range(1, 5):
+                    if i + offset < len(lines):
+                        next_line = lines[i + offset].strip().replace(',', '.')
+                        valid, val = is_valid_nrl(next_line)
+                        if valid:
+                            nrl = val
+                            break
+        
+        # Cập nhật kết quả tốt nhất
+        if score > best_score:
+            best_score = score
+            best_result = (stt, nrl)
     
+    # Trả về kết quả tốt nhất
+    if best_result:
+        return True, best_result[0], best_result[1]
+    
+    # Fallback: tìm thấy MSSV nhưng không xác định được chi tiết
+    # Kiểm tra lại tên có gần MSSV không
     for i, line in enumerate(lines):
-        if mssv in line:
-            stt = None
-            nrl = None
-            
-            if i >= 3:
-                stt_line = lines[i-3].strip()
-                if is_valid_stt(stt_line):
-                    stt = int(stt_line)
-            
-            if i + 1 < len(lines):
-                nrl_line = lines[i+1].strip().replace(',', '.')
-                valid, val = is_valid_nrl(nrl_line)
-                if valid:
-                    nrl = val
-            
-            return True, stt, nrl
+        if mssv_pattern.search(line):
+            context_start = max(0, i - 3)
+            context_end = min(len(lines), i + 4)
+            context_text = normalize_text(' '.join(lines[context_start:context_end]))
+            if ten_normalized in context_text or ten_cuoi in context_text:
+                return True, None, None
     
-    return True, None, None
+    return False, None, None
 
 
 def process_doc(doc, ten_sv, mssv, session):
@@ -243,7 +431,6 @@ def index():
 
 @app.route('/health')
 def health():
-    """Health check endpoint"""
     docs = get_doc_links()
     return jsonify({
         "status": "ok",
@@ -270,20 +457,31 @@ def search():
         results = []
         
         session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=MAX_WORKERS,
+            pool_maxsize=MAX_WORKERS
+        )
+        session.mount('https://', adapter)
         session.headers.update({"User-Agent": "Mozilla/5.0"})
         
         print(f"[INFO] Scanning {len(unique_docs)} files for {ten_sv} - {mssv}")
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [
-                executor.submit(process_doc, doc, ten_sv, mssv, session)
+            futures = {
+                executor.submit(process_doc, doc, ten_sv, mssv, session): doc 
                 for doc in unique_docs
-            ]
+            }
             
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    results.append(result)
+            try:
+                for future in as_completed(futures, timeout=25):
+                    try:
+                        result = future.result(timeout=1)
+                        if result:
+                            results.append(result)
+                    except:
+                        pass
+            except:
+                pass
         
         results.sort(key=lambda x: (x["stt"] if isinstance(x["stt"], int) else 9999))
         total_nrl = sum(r["nrl"] for r in results if isinstance(r["nrl"], (int, float)))
